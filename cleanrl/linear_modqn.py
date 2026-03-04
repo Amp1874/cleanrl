@@ -162,7 +162,7 @@ if __name__ == "__main__":
     reward_weights = args.reward_weights
     if reward_weights is None:
         reward_weights = [1.0] * reward_dimension
-    reward_weights = np.array(reward_weights)
+    reward_weights = torch.as_tensor(reward_weights, dtype=torch.float32)
     reward_weights = reward_weights / reward_weights.sum()
 
     q_network = QNetwork(envs).to(device)
@@ -191,6 +191,8 @@ if __name__ == "__main__":
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
             q_values = q_network(torch.Tensor(obs).to(device))
+
+            # TODO: Use a reshaped q_values to select the action with the highest scalarized value
             actions = torch.argmax(q_values, dim=1).cpu().numpy()
 
         # TRY NOT TO MODIFY: execute the game and log data.
@@ -235,30 +237,40 @@ if __name__ == "__main__":
                     
                     # Therefore, we need to find the maximum *per reward* here
                     next_obs_values = target_network(data.next_observations)
+                    # reshape to (B, A, R)
                     next_obs_values = next_obs_values.reshape(-1, envs.single_action_space.n, reward_dimension)
 
                     # Convert to scalar weighted so we can find the max
-                    next_obs_scalar = np.dot(next_obs_values, reward_weights)                    
+                    # shape = (B, A)
+                    next_obs_scalar = (next_obs_values * reward_weights).sum(dim=-1)
 
                     # Then select the vector that is corresponds to max scalarized
-                    target_argmax = np.argmax(next_obs_scalar, axis=1)
+                    target_argmax = next_obs_scalar.argmax(dim=1)
 
                     # DEBUG: Overriding one of the target max for one of the batch items
                     target_argmax[0] = 1
 
-                    target_max = torch.from_numpy(np.array([
-                        next_obs_values[i][target_argmax[i]] for i in range(next_obs_values.shape[0])
-                    ]))
+                    # Convert the argmax (which is now (B,)) to (B, 1, R) to allow tensor gather
+                    idx = target_argmax.view(-1, 1, 1).expand(-1, 1, reward_dimension)
+                    target_max = next_obs_values.gather(dim=1, index=idx).squeeze(1)
 
                     # Multiplying by 1-data.dones.flatten is to ignore the transitions from end of
                     # one episode to the start of the next
+                    # shape = (B, R)
                     td_target = data.rewards + args.gamma * target_max * (1 - data.dones)
 
-                old_val = q_network(data.observations).reshape(-1, envs.single_action_space.n, reward_dimension)
-                
-                old_val.gather(1, data.actions).squeeze()
+                old_val = q_network(data.observations)      # shape = (B, A*R)
 
-                loss = F.mse_loss(td_target, old_val)
+                # reshape to (B, A, R)
+                old_val = old_val.reshape(-1, envs.single_action_space.n, reward_dimension)
+                
+                # choose only actions that were actually taken
+                # need shape (B, R). data.actions is shape (B, 1) for single actions
+                # need to convert to (B, 1, R)
+                idx = data.actions.view(-1, 1, 1).expand(-1, 1, reward_dimension)
+                old_action_val = old_val.gather(dim=1, index=idx).squeeze(1)
+
+                loss = F.mse_loss(td_target, old_action_val)
 
 
 
