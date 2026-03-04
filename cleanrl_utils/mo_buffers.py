@@ -184,7 +184,7 @@ class MOReplayBuffer(BaseBuffer):
             # Only use dones that are not due to timeouts
             # deactivated by default (timeouts is initialized as an array of False)
             (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
-            self.rewards[batch_inds, env_indices].reshape(-1, 1),
+            self.rewards[batch_inds, env_indices].reshape(-1, self.reward_dimension),
         )
         return ReplayBufferSamples(*tuple(map(self.to_torch, data)))
 

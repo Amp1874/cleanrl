@@ -47,6 +47,10 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "mo-mountaincar-v0"
     """the id of the environment"""
+
+    reward_weights: list[float] | None = None
+    """Linear scalarization weights for the rewards. Default behaviour is equal weighting for all rewards"""
+
     total_timesteps: int = 500000
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
@@ -61,7 +65,7 @@ class Args:
     """the target network update rate"""
     target_network_frequency: int = 500
     """the timesteps it takes to update the target network"""
-    batch_size: int = 128
+    batch_size: int = 5 # TODO: return to 128
     """the batch size of sample from the reply memory"""
     start_e: float = 1
     """the starting epsilon for exploration"""
@@ -94,12 +98,15 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 class QNetwork(nn.Module):
     def __init__(self, env):
         super().__init__()
+
+        reward_dimension = env.reward_space.shape[0]
+
         self.network = nn.Sequential(
             nn.Linear(np.array(env.single_observation_space.shape).prod(), 120),
             nn.ReLU(),
             nn.Linear(120, 84),
             nn.ReLU(),
-            nn.Linear(84, env.single_action_space.n), # TODO: add * objective size
+            nn.Linear(84, env.single_action_space.n * reward_dimension),
         )
 
     def forward(self, x):
@@ -141,14 +148,22 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
+    assert args.num_envs == 1, "Only supports one environment at this time"
+
     # env setup
     # TODO: change to mo_gym.wrappers.vector.MOSyncVectorEnv.
     envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
         [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
-    envs.autoreset_mode = gym.vector.AutoresetMode(gym.vector.AutoresetMode.SAME_STEP)
-
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+
+    reward_dimension = envs.reward_space.shape[0]
+
+    reward_weights = args.reward_weights
+    if reward_weights is None:
+        reward_weights = [1.0] * reward_dimension
+    reward_weights = np.array(reward_weights)
+    reward_weights = reward_weights / reward_weights.sum()
 
     q_network = QNetwork(envs).to(device)
     optimizer = optim.Adam(q_network.parameters(), lr=args.learning_rate)
@@ -159,7 +174,7 @@ if __name__ == "__main__":
         args.buffer_size,
         envs.single_observation_space,
         envs.single_action_space,
-        envs.reward_space.shape[0],
+        reward_dimension,
         device,
         handle_timeout_termination=False,
     )
@@ -167,6 +182,8 @@ if __name__ == "__main__":
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
+    autoreset = np.zeros(envs.num_envs)
+    
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
@@ -180,20 +197,27 @@ if __name__ == "__main__":
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                if info and "episode" in info:
-                    print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                    writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                    writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+        # if "final_info" in infos:
+        #     for info in infos["final_info"]:
+        #         if info and "episode" in info:
+        #             print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+        #             writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
+        #             writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `terminal_observation`
         real_next_obs = next_obs.copy()
-        for idx, trunc in enumerate(truncations):
-            if trunc:
-                # real_next_obs[idx] = infos["terminal_observation"][idx]
-                real_next_obs[idx] = infos["final_obs"][idx]
-        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
+
+        # for idx, trunc in enumerate(truncations):
+        #     if trunc:
+        #         # real_next_obs[idx] = infos["terminal_observation"][idx]
+        #         real_next_obs[idx] = infos["final_obs"][idx]
+
+        # IMPORTANT: ONLY SUPPORTS A SINGLE ENVIRONMENT
+        # (or, rather, does not store transitions if any environment terminated and reset)
+        if not autoreset[0]:
+            rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
+        
+        autoreset = np.logical_or(terminations, truncations)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
@@ -203,10 +227,40 @@ if __name__ == "__main__":
             if global_step % args.train_frequency == 0:
                 data = rb.sample(args.batch_size)
                 with torch.no_grad():
-                    target_max, _ = target_network(data.next_observations).max(dim=1)
-                    td_target = data.rewards.flatten() + args.gamma * target_max * (1 - data.dones.flatten())
-                old_val = q_network(data.observations).gather(1, data.actions).squeeze()
+
+                    # Note that the output layer of the QNetwork is of dimension
+                    # actions * rewards
+
+                    # Steps
+                    
+                    # Therefore, we need to find the maximum *per reward* here
+                    next_obs_values = target_network(data.next_observations)
+                    next_obs_values = next_obs_values.reshape(-1, envs.single_action_space.n, reward_dimension)
+
+                    # Convert to scalar weighted so we can find the max
+                    next_obs_scalar = np.dot(next_obs_values, reward_weights)                    
+
+                    # Then select the vector that is corresponds to max scalarized
+                    target_argmax = np.argmax(next_obs_scalar, axis=1)
+
+                    # DEBUG: Overriding one of the target max for one of the batch items
+                    target_argmax[0] = 1
+
+                    target_max = torch.from_numpy(np.array([
+                        next_obs_values[i][target_argmax[i]] for i in range(next_obs_values.shape[0])
+                    ]))
+
+                    # Multiplying by 1-data.dones.flatten is to ignore the transitions from end of
+                    # one episode to the start of the next
+                    td_target = data.rewards + args.gamma * target_max * (1 - data.dones)
+
+                old_val = q_network(data.observations).reshape(-1, envs.single_action_space.n, reward_dimension)
+                
+                old_val.gather(1, data.actions).squeeze()
+
                 loss = F.mse_loss(td_target, old_val)
+
+
 
                 if global_step % 100 == 0:
                     writer.add_scalar("losses/td_loss", loss, global_step)
