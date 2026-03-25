@@ -192,8 +192,17 @@ if __name__ == "__main__":
         else:
             q_values = q_network(torch.Tensor(obs).to(device))
 
-            # TODO: Use a reshaped q_values to select the action with the highest scalarized value
-            actions = torch.argmax(q_values, dim=1).cpu().numpy()
+            # Therefore, we need to find the maximum *per reward* here
+            # reshape to (A, R)
+            q_values = q_values.reshape(envs.single_action_space.n, reward_dimension)
+
+            # Convert to scalar weighted so we can find the max
+            # shape = (A)
+            q_scalar = (q_values * reward_weights).sum(dim=-1)
+
+            # Then select the vector that is corresponds to max scalarized
+            # @TODO: For parallel environments this needs to be a vector for n environments
+            actions = torch.atleast_1d(q_scalar.argmax()).cpu().numpy()
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
@@ -276,9 +285,16 @@ if __name__ == "__main__":
 
                 if global_step % 100 == 0:
                     writer.add_scalar("losses/td_loss", loss, global_step)
-                    writer.add_scalar("losses/q_values", old_val.mean().item(), global_step)
-                    print("SPS:", int(global_step / (time.time() - start_time)))
-                    writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+                    q_per_reward = old_val.mean(dim=(0,1))
+
+                    for n in range(reward_dimension):
+                        writer.add_scalar(f"qvalues/q_{n}", q_per_reward[n], global_step )
+                    
+                    writer.add_scalar("qvalues/scalarised_q", (q_per_reward * reward_weights).sum(), global_step)
+                    print(f"global_step: {global_step}")
+                    # print("SPS:", int(global_step / (time.time() - start_time)))
+                    # writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
                 # optimize the model
                 optimizer.zero_grad()
