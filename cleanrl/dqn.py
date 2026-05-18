@@ -5,6 +5,10 @@ import time
 from dataclasses import dataclass
 
 import gymnasium as gym
+import mo_gymnasium as mo_gym
+from mo_gymnasium.wrappers import LinearReward
+
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -42,7 +46,7 @@ class Args:
     """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    env_id: str = "CartPole-v1"
+    env_id: str = "minecart-deterministic-v0" # was "CartPole-v1"
     """the id of the environment"""
     total_timesteps: int = 500000
     """total timesteps of the experiments"""
@@ -79,7 +83,14 @@ def make_env(env_id, seed, idx, capture_video, run_name):
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
+
+        if env.unwrapped.__module__.startswith('mo_'):
+            env = mo_gym.wrappers.LinearReward( # type: ignore
+                env,
+                weight=np.ones(env.unwrapped.reward_dim)) # type: ignore
+
         env = gym.wrappers.RecordEpisodeStatistics(env)
+
         env.action_space.seed(seed)
 
         return env
@@ -140,7 +151,10 @@ if __name__ == "__main__":
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
+        [
+            make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) 
+            for i in range(args.num_envs)
+        ]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
@@ -160,6 +174,8 @@ if __name__ == "__main__":
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
+    autoreset = np.zeros(envs.num_envs)
+    
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
@@ -182,10 +198,14 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
-        for idx, trunc in enumerate(truncations):
-            if trunc:
-                real_next_obs[idx] = infos["final_observation"][idx]
-        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
+        # for idx, trunc in enumerate(truncations):
+            #if trunc:
+                #real_next_obs[idx] = infos["final_observation"][idx]
+        
+        if not autoreset[0]:
+            rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
+
+        autoreset = np.logical_or(terminations, truncations)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
