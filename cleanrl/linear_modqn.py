@@ -45,7 +45,7 @@ class Args:
     """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    env_id: str = "mo-mountaincar-v0"
+    env_id: str = "minecart-deterministic-v0"
     """the id of the environment"""
 
     reward_weights: list[float] | None = None
@@ -65,7 +65,7 @@ class Args:
     """the target network update rate"""
     target_network_frequency: int = 500
     """the timesteps it takes to update the target network"""
-    batch_size: int = 5 # TODO: return to 128
+    batch_size: int = 128
     """the batch size of sample from the reply memory"""
     start_e: float = 1
     """the starting epsilon for exploration"""
@@ -83,7 +83,7 @@ def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
         if capture_video and idx == 0:
             env = mo_gym.make(env_id, render_mode="rgb_array")
-            env = mo_gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = mo_gym.make(env_id)
         env = mo_gym.wrappers.MORecordEpisodeStatistics(env)
@@ -151,7 +151,6 @@ if __name__ == "__main__":
     assert args.num_envs == 1, "Only supports one environment at this time"
 
     # env setup
-    # TODO: change to mo_gym.wrappers.vector.MOSyncVectorEnv.
     envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
         [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
@@ -163,7 +162,7 @@ if __name__ == "__main__":
     if reward_weights is None:
         reward_weights = [1.0] * reward_dimension
     reward_weights = torch.as_tensor(reward_weights, dtype=torch.float32)
-    reward_weights = reward_weights / reward_weights.sum()
+    
 
     q_network = QNetwork(envs).to(device)
     optimizer = optim.Adam(q_network.parameters(), lr=args.learning_rate)
@@ -208,12 +207,15 @@ if __name__ == "__main__":
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        # if "final_info" in infos:
-        #     for info in infos["final_info"]:
-        #         if info and "episode" in info:
-        #             print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-        #             writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-        #             writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+        if infos and "_episode" in infos:
+            episode = infos['episode']
+            for env_idx, ep in enumerate(infos["_episode"]):
+                if ep:
+                    print(f"global_step={global_step}, episodic_return={episode['r'][env_idx]}")
+                    for i, r in enumerate(episode['r'][env_idx]):
+                        writer.add_scalar(f"charts/episodic_return_{i}", r, global_step)
+                    writer.add_scalar("charts/scalar_episodic_return", (episode['r'][env_idx] * reward_weights.numpy()).sum(), global_step)
+                    writer.add_scalar("charts/episodic_length", episode["l"][env_idx], global_step)
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `terminal_observation`
         real_next_obs = next_obs.copy()
@@ -251,7 +253,8 @@ if __name__ == "__main__":
 
                     # Convert to scalar weighted so we can find the max
                     # shape = (B, A)
-                    next_obs_scalar = (next_obs_values * reward_weights).sum(dim=-1)
+                    next_obs_scaled = (next_obs_values * reward_weights)
+                    next_obs_scalar = next_obs_scaled.sum(dim=-1)
 
                     # Then select the vector that is corresponds to max scalarized
                     target_argmax = next_obs_scalar.argmax(dim=1)
