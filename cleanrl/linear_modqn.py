@@ -80,14 +80,14 @@ class Args:
     """the frequency of training"""
 
 
-def make_env(env_id, seed, idx, capture_video, run_name):
+def make_env(env_id, seed, idx, capture_video, run_name, gamma=1.0):
     def thunk():
         if capture_video and idx == 0:
             env = mo_gym.make(env_id, render_mode="rgb_array")
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = mo_gym.make(env_id)
-        env = mo_gym.wrappers.MORecordEpisodeStatistics(env)
+        env = mo_gym.wrappers.MORecordEpisodeStatistics(env, gamma=gamma)
         env.action_space.seed(seed)
         #DEBUG - calc and display Pareto Front and CCS
         #for res in env.unwrapped.pareto_front(0.98):
@@ -157,7 +157,7 @@ if __name__ == "__main__":
 
     # env setup
     envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
+        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name, gamma=args.gamma) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
@@ -189,29 +189,40 @@ if __name__ == "__main__":
     autoreset = np.zeros(envs.num_envs)
     
     for global_step in range(args.total_timesteps):
+
+        # Select the greedy action, and then override with e-greedy
+        # This lets us log the greedy action in all cases, even if we choose a
+        # random action
+        q_values = q_network(torch.Tensor(obs).to(device))
+
+        # Therefore, we need to find the maximum *per reward* here
+        # reshape to (A, R)
+        q_values = q_values.reshape(envs.single_action_space.n, reward_dimension)
+
+        # Convert to scalar weighted so we can find the max
+        # shape = (A)
+        q_scalar = (q_values * reward_weights).sum(dim=-1)
+
+        # Then select the vector that corresponds to max scalarized
+        # @TODO: For parallel environments this needs to be a vector for n environments
+        greedy_actions = actions = torch.atleast_1d(q_scalar.argmax()).cpu().numpy()
+        
         # ALGO LOGIC: put action logic here
         epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
         if random.random() < epsilon:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
-        else:
-            q_values = q_network(torch.Tensor(obs).to(device))
 
-            # Therefore, we need to find the maximum *per reward* here
-            # reshape to (A, R)
-            q_values = q_values.reshape(envs.single_action_space.n, reward_dimension)
-
-            # Convert to scalar weighted so we can find the max
-            # shape = (A)
-            q_scalar = (q_values * reward_weights).sum(dim=-1)
-
-            # Then select the vector that is corresponds to max scalarized
-            # @TODO: For parallel environments this needs to be a vector for n environments
-            actions = torch.atleast_1d(q_scalar.argmax()).cpu().numpy()
-
+        if autoreset[0] or global_step == 0:
+            # If we start an episode, log the Q value for the greedy action (regardless of what it was)
+            start_q_values = q_values[greedy_actions[0]]
+            start_q_scalar = q_scalar[greedy_actions[0]]
+        
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
+        # Caution: As elsewhere, the plotting of overestimation is based on a single environment.
+        # If there are multiple environments, the same starting q value is plotted multiple times.
         if infos and "_episode" in infos:
             episode = infos['episode']
             for env_idx, ep in enumerate(infos["_episode"]):
@@ -219,7 +230,27 @@ if __name__ == "__main__":
                     print(f"global_step={global_step}, episodic_return={episode['r'][env_idx]}")
                     for i, r in enumerate(episode['r'][env_idx]):
                         writer.add_scalar(f"charts/episodic_return_{i}", r, global_step)
+
+                    for i, r in enumerate(episode['dr'][env_idx]):
+                        writer.add_scalar(f"charts/discounted_episodic_return_{i}", r, global_step)
+
+                    for n in range(reward_dimension):
+                        writer.add_scalar(f"qvalues/greedy_{n}", start_q_values[n], global_step )
+                    
+                    writer.add_scalar("qvalues/greedy_scalarised_q", start_q_scalar, global_step)
+
+                    overestimation = start_q_values.detach().numpy() - episode['dr'][env_idx]
+                    for i, r in enumerate(overestimation):
+                        writer.add_scalar(f"overestimation/q_{i}", r, global_step)
+
                     writer.add_scalar("charts/scalar_episodic_return", (episode['r'][env_idx] * reward_weights.numpy()).sum(), global_step)
+
+                    discounted_scalar_episodic_return = (episode['dr'][env_idx] * reward_weights.numpy()).sum()
+
+                    writer.add_scalar("charts/discounted_scalar_episodic_return", discounted_scalar_episodic_return, global_step)
+                    writer.add_scalar("overestimation/q_scalar", start_q_scalar - discounted_scalar_episodic_return, global_step)
+                                      
+                    
                     writer.add_scalar("charts/episodic_length", episode["l"][env_idx], global_step)
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `terminal_observation`
@@ -290,13 +321,7 @@ if __name__ == "__main__":
 
                 if global_step % 100 == 0:
                     writer.add_scalar("losses/td_loss", loss, global_step)
-
-                    q_per_reward = old_val.mean(dim=(0,1))
-
-                    for n in range(reward_dimension):
-                        writer.add_scalar(f"qvalues/q_{n}", q_per_reward[n], global_step )
                     
-                    writer.add_scalar("qvalues/scalarised_q", (q_per_reward * reward_weights).sum(), global_step)
                     print(f"global_step: {global_step}")
                     # print("SPS:", int(global_step / (time.time() - start_time)))
                     # writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
