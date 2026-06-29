@@ -2,6 +2,7 @@
 import os
 import random
 import time
+import sys
 from dataclasses import dataclass
 
 import gymnasium as gym
@@ -88,6 +89,10 @@ def make_env(env_id, seed, idx, capture_video, run_name):
             env = mo_gym.make(env_id)
         env = mo_gym.wrappers.MORecordEpisodeStatistics(env)
         env.action_space.seed(seed)
+        #DEBUG - calc and display Pareto Front and CCS
+        #for res in env.unwrapped.pareto_front(0.98):
+        #    print(np.array2string(res, separator=","))
+        #sys.exit()
 
         return env
 
@@ -258,9 +263,6 @@ if __name__ == "__main__":
 
                     # Then select the vector that is corresponds to max scalarized
                     target_argmax = next_obs_scalar.argmax(dim=1)
-
-                    # DEBUG: Overriding one of the target max for one of the batch items
-                    target_argmax[0] = 1
 
                     # Convert the argmax (which is now (B,)) to (B, 1, R) to allow tensor gather
                     idx = target_argmax.view(-1, 1, 1).expand(-1, 1, reward_dimension)
