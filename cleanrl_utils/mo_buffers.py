@@ -11,6 +11,14 @@ from gymnasium import spaces
 
 from .buffers import BaseBuffer, ReplayBufferSamples, RolloutBufferSamples
 
+class PreferenceReplayBufferSamples(NamedTuple):
+    observations: th.Tensor
+    actions: th.Tensor
+    next_observations: th.Tensor
+    dones: th.Tensor
+    rewards: th.Tensor
+    preferences: th.Tensor
+
 try:
     # Check memory used by replay buffer when possible
     import psutil
@@ -25,6 +33,7 @@ class MOReplayBuffer(BaseBuffer):
     :param observation_space: Observation space
     :param action_space: Action space
     :param reward_dimension: Integer number of reward dimensions for MORL
+    :param store_preferences: Boolean, whether preferences should be stored or not
     :param device: PyTorch device
     :param n_envs: Number of parallel environments
     :param optimize_memory_usage: Enable a memory efficient variant
@@ -42,6 +51,7 @@ class MOReplayBuffer(BaseBuffer):
     next_observations: np.ndarray
     actions: np.ndarray
     rewards: np.ndarray
+    preferences: np.ndarray
     dones: np.ndarray
     timeouts: np.ndarray
 
@@ -51,6 +61,7 @@ class MOReplayBuffer(BaseBuffer):
         observation_space: spaces.Space,
         action_space: spaces.Space,
         reward_dimension: int = 1,
+        store_preferences: bool = False,
         device: th.device | str = "auto",
         n_envs: int = 1,
         optimize_memory_usage: bool = False,
@@ -62,6 +73,9 @@ class MOReplayBuffer(BaseBuffer):
         self.buffer_size = max(buffer_size // n_envs, 1)
 
         self.reward_dimension = reward_dimension
+
+        # Should we store the preferences under which each transition was experienced?
+        self.store_preferences = store_preferences
 
         # Check that the replay buffer can fit into the memory
         if psutil is not None:
@@ -87,6 +101,10 @@ class MOReplayBuffer(BaseBuffer):
         )
 
         self.rewards = np.zeros((self.buffer_size, self.n_envs, self.reward_dimension), dtype=np.float32)
+
+        if self.store_preferences:
+            self.preferences = np.zeros((self.buffer_size, self.n_envs, self.reward_dimension), dtype=np.float32)
+
         self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         # Handle timeouts termination properly if needed
         # see https://github.com/DLR-RM/stable-baselines3/issues/284
@@ -118,6 +136,7 @@ class MOReplayBuffer(BaseBuffer):
         reward: np.ndarray,
         done: np.ndarray,
         infos: list[dict[str, Any]],
+        preferences: np.ndarray | None = None,  # must be passed if self.store_preferences is True
     ) -> None:
         # Reshape needed when using multiple envs with discrete observations
         # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
@@ -140,6 +159,9 @@ class MOReplayBuffer(BaseBuffer):
         self.rewards[self.pos] = np.array(reward)
         self.dones[self.pos] = np.array(done)
 
+        if self.store_preferences:
+            self.preferences[self.pos] = np.array(preferences)
+
         if self.handle_timeout_termination:
             self.timeouts[self.pos] = np.array([info.get("TimeLimit.truncated", False) for info in infos])
 
@@ -148,7 +170,7 @@ class MOReplayBuffer(BaseBuffer):
             self.full = True
             self.pos = 0
 
-    def sample(self, batch_size: int) -> ReplayBufferSamples:
+    def sample(self, batch_size: int) -> ReplayBufferSamples | PreferenceReplayBufferSamples:
         """
         Sample elements from the replay buffer.
         Custom sampling when using memory efficient variant,
@@ -156,7 +178,7 @@ class MOReplayBuffer(BaseBuffer):
         See https://github.com/DLR-RM/stable-baselines3/pull/28#issuecomment-637559274
 
         :param batch_size: Number of element to sample
-        :return:
+        :return: Either ReplayBufferSamples, or a PreferenceReplayBufferSamples
         """
         if not self.optimize_memory_usage:
             return super().sample(batch_size=batch_size)
@@ -168,7 +190,7 @@ class MOReplayBuffer(BaseBuffer):
             batch_inds = np.random.randint(0, self.pos, size=batch_size)
         return self._get_samples(batch_inds)
 
-    def _get_samples(self, batch_inds: np.ndarray) -> ReplayBufferSamples:
+    def _get_samples(self, batch_inds: np.ndarray) -> ReplayBufferSamples | PreferenceReplayBufferSamples:
         # Sample randomly the env idx
         env_indices = np.random.randint(0, high=self.n_envs, size=(len(batch_inds),))
 
@@ -186,7 +208,15 @@ class MOReplayBuffer(BaseBuffer):
             (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
             self.rewards[batch_inds, env_indices].reshape(-1, self.reward_dimension),
         )
-        return ReplayBufferSamples(*tuple(map(self.to_torch, data)))
+
+        if self.store_preferences:
+            data = data + (self.preferences[batch_inds, env_indices].reshape(-1, self.reward_dimension),)
+            buffer_samples = PreferenceReplayBufferSamples(*tuple(map(self.to_torch, data)))
+        else:
+            buffer_samples = ReplayBufferSamples(*tuple(map(self.to_torch, data)))
+        
+        return buffer_samples
+
 
     @staticmethod
     def _maybe_cast_dtype(dtype: np.typing.DTypeLike) -> np.typing.DTypeLike:
